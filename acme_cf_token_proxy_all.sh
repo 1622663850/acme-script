@@ -116,7 +116,10 @@ inst_acme(){
     fi
 
     yellow "正在安装 acme.sh..."
-    if ! bash "$ACME_TMP_DIR/acme.sh-master/acme.sh" --install -m "$email"; then
+    if ! (
+        cd "$ACME_TMP_DIR/acme.sh-master" || exit 1
+        bash ./acme.sh --install -m "$email"
+    ); then
         red "acme.sh 安装失败"
         rm -rf "$ACME_TMP_DIR"
         exit 1
