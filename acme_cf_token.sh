@@ -26,7 +26,18 @@ PACKAGE_UNINSTALL=("apt -y autoremove" "apt -y autoremove" "yum -y autoremove" "
 
 [[ $EUID -ne 0 ]] && red "注意：请在root用户下运行脚本" && exit 1
 
-CMD=("$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(hostnamectl 2>/dev/null | grep -i system | cut -d : -f2)" "$(lsb_release -sd 2>/dev/null)" "$(grep -i description /etc/lsb-release 2>/dev/null | cut -d \" -f2)" "$(grep . /etc/redhat-release 2>/dev/null)" "$(grep . /etc/issue 2>/dev/null | cut -d \\ -f1 | sed '/^[ ]*$/d')")
+if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+fi
+
+CMD=(
+    "${PRETTY_NAME:-}"
+    "$(hostnamectl 2>/dev/null | sed -n 's/^[[:space:]]*Operating System:[[:space:]]*//p')"
+    "$(lsb_release -sd 2>/dev/null | tr -d '\"')"
+    "$(grep -i '^DISTRIB_DESCRIPTION=' /etc/lsb-release 2>/dev/null | sed 's/^[^=]*=//; s/^"//; s/"$//')"
+    "$(cat /etc/redhat-release 2>/dev/null)"
+    "$(head -n 1 /etc/issue 2>/dev/null)"
+)
 
 for i in "${CMD[@]}"; do
     SYS="$i"
@@ -48,43 +59,143 @@ check_ip(){
     ipv6=$(curl -s6m8 ip.sb -k | sed -n 1p)
 }
 
-inst_acme(){
-    if [[ ! $SYSTEM == "CentOS" ]]; then
+install_acme_direct() {
+    local email="$1" installer
+    installer=$(mktemp) || { red "创建临时文件失败"; return 1; }
+
+    yellow "正在从官方渠道安装 acme.sh..."
+    if ! curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 \
+        "https://get.acme.sh" -o "$installer"; then
+        rm -f "$installer"
+        red "官方安装脚本下载失败，请重试或选择代理安装"
+        return 1
+    fi
+
+    if ! sh "$installer" "email=$email"; then
+        rm -f "$installer"
+        red "acme.sh 官方安装失败"
+        return 1
+    fi
+    rm -f "$installer"
+
+    # 官方模式启用 acme.sh 自动升级；升级失败不影响已完成的安装。
+    if ! bash "$HOME/.acme.sh/acme.sh" --upgrade --auto-upgrade; then
+        yellow "自动升级配置未完成，可稍后执行 acme.sh --upgrade --auto-upgrade"
+    fi
+}
+
+install_acme_proxy() {
+    local email="$1" tmp_dir archive_url acme_bin
+    local proxy_url="https://gh.dpik.top/"
+
+    archive_url="${proxy_url}https://github.com/acmesh-official/acme.sh/archive/master.tar.gz"
+    yellow "正在通过 GitHub 代理下载 acme.sh: $proxy_url"
+    yellow "注意：第三方下载代理可能不可用，且需要您信任该代理服务。"
+
+    tmp_dir=$(mktemp -d) || { red "创建临时目录失败"; return 1; }
+    if ! curl -fL --retry 3 --connect-timeout 15 --max-time 180 \
+        "$archive_url" -o "$tmp_dir/master.tar.gz"; then
+        rm -rf "$tmp_dir"
+        red "代理下载失败，请检查代理地址或网络"
+        return 1
+    fi
+
+    if ! tar -xzf "$tmp_dir/master.tar.gz" -C "$tmp_dir" || \
+       [[ ! -f "$tmp_dir/acme.sh-master/acme.sh" ]]; then
+        rm -rf "$tmp_dir"
+        red "acme.sh 压缩包解压失败或缺少安装文件"
+        return 1
+    fi
+
+    if ! (cd "$tmp_dir/acme.sh-master" && bash ./acme.sh --install -m "$email"); then
+        rm -rf "$tmp_dir"
+        red "acme.sh 代理安装失败"
+        return 1
+    fi
+    rm -rf "$tmp_dir"
+
+    # 尽量让后续 GitHub 源码升级也走代理，若上游变更需重新适配。
+    acme_bin="$HOME/.acme.sh/acme.sh"
+    if [[ -f "$acme_bin" ]] && \
+       grep -Fq 'PROJECT="https://github.com/acmesh-official/$PROJECT_NAME"' "$acme_bin"; then
+        if ! sed -i \
+            's#PROJECT="https://github.com/acmesh-official/$PROJECT_NAME"#PROJECT="https://gh.dpik.top/https://github.com/acmesh-official/$PROJECT_NAME"#' \
+            "$acme_bin"; then
+            yellow "安装已完成，但设置后续升级代理失败"
+        fi
+    else
+        yellow "安装已完成，但当前 acme.sh 版本的升级地址结构不匹配，无法保证升级走代理"
+    fi
+    yellow "代理模式未自动启用 acme.sh 自身的自动升级（不影响证书自动续期）"
+}
+
+inst_acme() {
+    local install_mode="${1:-direct}" email automail
+    if [[ "$install_mode" != "direct" && "$install_mode" != "proxy" ]]; then
+        red "未知的安装方式"
+        return 1
+    fi
+
+    if [[ "$SYSTEM" != "CentOS" ]]; then
         ${PACKAGE_UPDATE[int]}
     fi
-    ${PACKAGE_INSTALL[int]} curl wget sudo socat openssl dnsutils
+    ${PACKAGE_INSTALL[int]} curl wget sudo socat openssl dnsutils tar || return 1
 
-    if [[ $SYSTEM == "CentOS" ]]; then
-        ${PACKAGE_INSTALL[int]} cronie
+    if [[ "$SYSTEM" == "CentOS" ]]; then
+        ${PACKAGE_INSTALL[int]} cronie || return 1
         systemctl start crond
         systemctl enable crond
     else
-        ${PACKAGE_INSTALL[int]} cron
+        ${PACKAGE_INSTALL[int]} cron || return 1
         systemctl start cron
         systemctl enable cron
     fi
 
     read -rp "请输入注册邮箱 (例: admin@gmail.com, 或留空自动生成一个gmail邮箱): " email
-    if [[ -z $email ]]; then
+    if [[ -z "$email" ]]; then
         automail=$(date +%s%N | md5sum | cut -c 1-16)
-        email=$automail@gmail.com
-        yellow "已取消设置邮箱, 使用自动生成的gmail邮箱: $email"
+        email="$automail@gmail.com"
+        yellow "未填写邮箱，使用自动生成的邮箱: $email"
     fi
 
-    curl https://get.acme.sh | sh -s email=$email
-    source ~/.bashrc
-    bash ~/.acme.sh/acme.sh --upgrade --auto-upgrade
-    
-    switch_provider
-
-    if [[ -n $(~/.acme.sh/acme.sh -v 2>/dev/null) ]]; then
-        green "Acme.sh 证书一键申请脚本安装成功!"
+    if [[ "$install_mode" == "proxy" ]]; then
+        install_acme_proxy "$email" || return 1
     else
-        red "抱歉, Acme.sh 证书一键申请脚本安装失败"
-        green "建议如下："
-        yellow "1. 检查 VPS 的网络环境"
-        yellow "2. 脚本可能跟不上时代, 建议截图发布到 GitHub Issues 询问"
+        install_acme_direct "$email" || return 1
     fi
+
+    if ! bash "$HOME/.acme.sh/acme.sh" -v >/dev/null 2>&1; then
+        red "安装结束，但未检测到可用的 acme.sh"
+        return 1
+    fi
+
+    source "$HOME/.bashrc" 2>/dev/null || true
+    green "acme.sh 安装成功！"
+    switch_provider
+}
+
+install_menu() {
+    local choice
+    echo ""
+    echo -e " ${GREEN}1.${PLAIN} 官方直连安装 acme.sh"
+    echo -e " ${GREEN}2.${PLAIN} 通过 GitHub 代理安装 acme.sh ${YELLOW}(gh.dpik.top)${PLAIN}"
+    echo -e " ${GREEN}0.${PLAIN} 返回"
+    read -rp "请选择安装方式 [0-2]: " choice
+    case "$choice" in
+        1) inst_acme direct ;;
+        2) inst_acme proxy ;;
+        0) return 1 ;;
+        *) red "无效选项"; return 1 ;;
+    esac
+}
+
+ensure_acme() {
+    if [[ -f "$HOME/.acme.sh/acme.sh" ]] && \
+       bash "$HOME/.acme.sh/acme.sh" -v >/dev/null 2>&1; then
+        return 0
+    fi
+    yellow "未安装 acme.sh，请先选择安装方式"
+    install_menu
 }
 
 unst_acme() {
@@ -160,7 +271,7 @@ checktls() {
 }
 
 acme_standalone(){
-    [[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && inst_acme
+    ensure_acme || return 1
 
     check_80
 
@@ -247,7 +358,7 @@ acme_standalone(){
 }
 
 acme_cfapiTLD(){
-    [[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && inst_acme
+    ensure_acme || return 1
 
     read -rp "请输入需要申请证书的域名: " domain
     [[ -z $domain ]] && red "未输入域名，无法执行操作！" && exit 1
@@ -299,7 +410,7 @@ acme_cfapiTLD(){
 }
 
 acme_cfapiNTLD(){
-    [[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && inst_acme
+    ensure_acme || return 1
 
     read -rp "请输入需要申请证书的泛域名 (输入格式：example.com): " domain
     [[ -z $domain ]] && red "未输入域名，无法执行操作！" && exit 1
@@ -356,12 +467,12 @@ acme_cfapiNTLD(){
 }
 
 view_cert(){
-    [[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && inst_acme
+    ensure_acme || return 1
     bash ~/.acme.sh/acme.sh --list
 }
 
 revoke_cert() {
-    [[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && inst_acme
+    ensure_acme || return 1
 
     bash ~/.acme.sh/acme.sh --list
     read -rp "请输入要撤销的域名证书 (复制 Main_Domain 下显示的域名): " domain
@@ -386,7 +497,7 @@ renew_cert() {
 }
 
 switch_provider(){
-    [[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && inst_acme
+    ensure_acme || return 1
 
     yellow "请选择证书提供商, 默认通过 Letsencrypt.org 来申请证书 "
     yellow "如果证书申请失败, 例如一天内通过 Letsencrypt.org 申请次数过多, 可选 BuyPass.com 或 ZeroSSL.com 来申请."
@@ -409,7 +520,7 @@ menu() {
     echo -e "# ${GREEN}GitHub 项目${PLAIN}: https://github.com/1622663850/acme-script    #"
     echo "#############################################################"
     echo ""
-    echo -e " ${GREEN}1.${PLAIN} 安装 Acme.sh 域名证书申请脚本"
+    echo -e " ${GREEN}1.${PLAIN} 安装 Acme.sh 域名证书申请脚本 ${YELLOW}(官方/代理)${PLAIN}"
     echo -e " ${GREEN}2.${PLAIN} ${RED}卸载 Acme.sh 域名证书申请脚本${PLAIN}"
     echo " -------------"
     echo -e " ${GREEN}3.${PLAIN} 申请单域名证书 ${YELLOW}(80端口申请)${PLAIN}"
@@ -425,7 +536,7 @@ menu() {
     echo ""
     read -rp "请输入选项 [0-9]: " menuInput
     case "$menuInput" in
-        1 ) inst_acme ;;
+        1 ) install_menu ;;
         2 ) unst_acme ;;
         3 ) acme_standalone ;;
         4 ) acme_cfapiTLD ;;
