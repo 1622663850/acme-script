@@ -1,4 +1,5 @@
 #!/bin/bash
+# acme-script: persistent-menu-v1
 
 RED="\033[31m"
 GREEN="\033[32m"
@@ -513,40 +514,45 @@ switch_provider(){
 }
 
 menu() {
-    clear
-     echo "#############################################################"
-    echo -e "#                   ${RED}Acme  证书一键申请脚本${PLAIN}                  #"
-    echo -e "# ${GREEN}作者${PLAIN}: 1622663850                                          #"
-    echo -e "# ${GREEN}GitHub 项目${PLAIN}: https://github.com/1622663850/acme-script    #"
-    echo "#############################################################"
-    echo ""
-    echo -e " ${GREEN}1.${PLAIN} 安装 Acme.sh 域名证书申请脚本 ${YELLOW}(官方/代理)${PLAIN}"
-    echo -e " ${GREEN}2.${PLAIN} ${RED}卸载 Acme.sh 域名证书申请脚本${PLAIN}"
-    echo " -------------"
-    echo -e " ${GREEN}3.${PLAIN} 申请单域名证书 ${YELLOW}(80端口申请)${PLAIN}"
-    echo -e " ${GREEN}4.${PLAIN} 申请单域名证书 ${YELLOW}(CF API申请)${PLAIN} ${GREEN}(无需解析)${PLAIN} ${RED}(不支持freenom域名)${PLAIN}"
-    echo -e " ${GREEN}5.${PLAIN} 申请泛域名证书 ${YELLOW}(CF API申请)${PLAIN} ${GREEN}(无需解析)${PLAIN} ${RED}(不支持freenom域名)${PLAIN}"
-    echo " -------------"
-    echo -e " ${GREEN}6.${PLAIN} 查看已申请的证书"
-    echo -e " ${GREEN}7.${PLAIN} 撤销并删除已申请的证书"
-    echo -e " ${GREEN}8.${PLAIN} 手动续期已申请的证书"
-    echo -e " ${GREEN}9.${PLAIN} 切换证书颁发机构"
-    echo " -------------"
-    echo -e " ${GREEN}0.${PLAIN} 退出脚本"
-    echo ""
-    read -rp "请输入选项 [0-9]: " menuInput
-    case "$menuInput" in
-        1 ) install_menu ;;
-        2 ) unst_acme ;;
-        3 ) acme_standalone ;;
-        4 ) acme_cfapiTLD ;;
-        5 ) acme_cfapiNTLD ;;
-        6 ) view_cert ;;
-        7 ) revoke_cert ;;
-        8 ) renew_cert ;;
-        9 ) switch_provider ;;
-        * ) exit 1 ;;
-    esac
+    local menuInput _menu_pause
+    while true; do
+        clear
+         echo "#############################################################"
+        echo -e "#                   ${RED}Acme  证书一键申请脚本${PLAIN}                  #"
+        echo -e "# ${GREEN}作者${PLAIN}: 1622663850                                          #"
+        echo -e "# ${GREEN}GitHub 项目${PLAIN}: https://github.com/1622663850/acme-script    #"
+        echo "#############################################################"
+        echo ""
+        echo -e " ${GREEN}1.${PLAIN} 安装 Acme.sh 域名证书申请脚本 ${YELLOW}(官方/代理)${PLAIN}"
+        echo -e " ${GREEN}2.${PLAIN} ${RED}卸载 Acme.sh 域名证书申请脚本${PLAIN}"
+        echo " -------------"
+        echo -e " ${GREEN}3.${PLAIN} 申请单域名证书 ${YELLOW}(80端口申请)${PLAIN}"
+        echo -e " ${GREEN}4.${PLAIN} 申请单域名证书 ${YELLOW}(CF API申请)${PLAIN} ${GREEN}(无需解析)${PLAIN} ${RED}(不支持freenom域名)${PLAIN}"
+        echo -e " ${GREEN}5.${PLAIN} 申请泛域名证书 ${YELLOW}(CF API申请)${PLAIN} ${GREEN}(无需解析)${PLAIN} ${RED}(不支持freenom域名)${PLAIN}"
+        echo " -------------"
+        echo -e " ${GREEN}6.${PLAIN} 查看已申请的证书"
+        echo -e " ${GREEN}7.${PLAIN} 撤销并删除已申请的证书"
+        echo -e " ${GREEN}8.${PLAIN} 手动续期已申请的证书"
+        echo -e " ${GREEN}9.${PLAIN} 切换证书颁发机构"
+        echo " -------------"
+        echo -e " ${GREEN}0.${PLAIN} 退出脚本"
+        echo ""
+        read -rp "请输入选项 [0-9]: " menuInput || return 0
+        case "$menuInput" in
+            1 ) ( install_menu ) || true ;;
+            2 ) ( unst_acme ) || true ;;
+            3 ) ( acme_standalone ) || true ;;
+            4 ) ( acme_cfapiTLD ) || true ;;
+            5 ) ( acme_cfapiNTLD ) || true ;;
+            6 ) ( view_cert ) || true ;;
+            7 ) ( revoke_cert ) || true ;;
+            8 ) ( renew_cert ) || true ;;
+            9 ) ( switch_provider ) || true ;;
+            0 ) return 0 ;;
+            * ) red "无效选项，请输入 0–9。" ;;
+        esac
+        read -rp "按回车键返回 ACME 证书菜单..." _menu_pause || return 0
+    done
 }
 
 menu
