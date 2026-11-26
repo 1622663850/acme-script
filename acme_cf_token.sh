@@ -1,6 +1,14 @@
 #!/bin/bash
 # acme-script: persistent-menu-v1
 
+readonly SCRIPT_VERSION="1.0.0"
+
+# Version queries must not require root, ACME installation, or OS detection.
+if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
+    printf 'acme-script v%s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
+
 RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
@@ -664,6 +672,7 @@ menu() {
          echo "#############################################################"
         echo -e "#                   ${RED}Acme  证书一键申请脚本${PLAIN}                  #"
         echo -e "# ${GREEN}作者${PLAIN}: 1622663850                                          #"
+        printf '# 版本: v%-50s #\n' "$SCRIPT_VERSION"
         echo -e "# ${GREEN}GitHub 项目${PLAIN}: https://github.com/1622663850/acme-script    #"
         echo "#############################################################"
         echo ""

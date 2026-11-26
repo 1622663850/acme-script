@@ -42,6 +42,10 @@ class AcmeMenuContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.source_text = SOURCE.read_text(encoding="utf-8")
+        match = re.search(r'^readonly SCRIPT_VERSION="(\d+\.\d+\.\d+)"$', cls.source_text, re.M)
+        if match is None:
+            raise AssertionError("missing script version")
+        cls.version = match.group(1)
         cls.install_menu = extract_function(cls.source_text, "install_menu")
         cls.menu = extract_function(cls.source_text, "menu")
 
@@ -53,6 +57,7 @@ class AcmeMenuContractTest(unittest.TestCase):
             events = Path(temp) / "events.log"
             script = "\n".join([
                 "set -u",
+                f"SCRIPT_VERSION='{self.version}'",
                 "GREEN=''; RED=''; YELLOW=''; PLAIN=''",
                 "clear(){ :; }",
                 "red(){ printf '%s\\n' \"$*\"; }",
@@ -129,6 +134,24 @@ class AcmeMenuContractTest(unittest.TestCase):
         result, events = self.run_menu("1\n1\n", install_status=0)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(events, ["inst:direct"])
+
+    def test_version_is_displayed_when_menu_is_redrawn(self) -> None:
+        result, events = self.run_menu("6\n\n0\n")
+        self.assert_returns_to_menu(result)
+        self.assertEqual(events, ["view"])
+        self.assertEqual(result.stdout.count(f"版本: v{self.version}"), 2)
+
+    def test_cli_version_flags_exit_without_menu(self) -> None:
+        for flag in ("--version", "-v"):
+            with self.subTest(flag=flag):
+                result = subprocess.run(
+                    ["bash", str(SOURCE), flag],
+                    text=True, capture_output=True, timeout=5,
+                    env=dict(os.environ, HOME="/nonexistent"),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f"acme-script v{self.version}\n")
+                self.assertEqual(result.stderr, "")
 
     def test_main_zero_exits_without_running_any_action(self) -> None:
         result, events = self.run_menu("0\n")
