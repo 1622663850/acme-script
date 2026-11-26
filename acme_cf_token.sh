@@ -237,42 +237,159 @@ check_80(){
     fi
 }
 
-checktls() {
-    if [[ -f /root/cert.crt && -f /root/private.key ]]; then
-        if [[ -s /root/cert.crt && -s /root/private.key ]]; then
-            if [[ -n $(type -P wg-quick) && -n $(type -P wgcf) ]]; then
-                wg-quick up wgcf >/dev/null 2>&1
-            fi
-            if [[ -a "/opt/warp-go/warp-go" ]]; then
-                systemctl start warp-go 
-            fi
+# ECC keeps the historical export paths. RSA has a separate ACME slot and
+# per-domain export directory so its renewal cannot overwrite ECC.
+select_key_type() {
+    local choice
+    echo ""
+    yellow "请选择证书密钥类型："
+    echo " 1. ECC 256（默认）"
+    echo " 2. RSA 2048"
+    echo " 3. RSA 4096"
+    read -rp "请输入选项 [1-3]: " choice || return 1
+    case "$choice" in
+        1|"") CERT_KEY_LENGTH=ec-256; CERT_TYPE=ECC; CERT_TYPE_ARGS=(--ecc) ;;
+        2) CERT_KEY_LENGTH=2048; CERT_TYPE=RSA; CERT_TYPE_ARGS=(--keylength 2048) ;;
+        3) CERT_KEY_LENGTH=4096; CERT_TYPE=RSA; CERT_TYPE_ARGS=(--keylength 4096) ;;
+        *) red "无效的证书密钥类型"; return 1 ;;
+    esac
+}
 
-            echo $domain > /root/ca.log
-            sed -i '/--cron/d' /etc/crontab >/dev/null 2>&1
-            echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
+valid_cert_domain() {
+    # Allow DNS names (including punycode) and a leading wildcard only.
+    [[ "$1" =~ ^(\*\.)?([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]
+}
 
-            green "证书申请成功! 脚本申请到的证书 (cert.crt) 和私钥 (private.key) 文件已保存到 /root 文件夹下"
-            yellow "证书 crt 文件路径如下: /root/cert.crt"
-            yellow "私钥 key 文件路径如下: /root/private.key"
+cert_paths() {
+    local main_domain="$1" output_root="${2:-/root}" cert_dir
+    valid_cert_domain "$main_domain" || { red "域名格式无效"; return 1; }
+
+    CERT_HOME="$HOME/.acme.sh/$main_domain"
+    if [[ "$CERT_TYPE" == ECC ]]; then
+        CERT_HOME="${CERT_HOME}_ecc"
+        CERT_KEY_FILE="$output_root/private.key"
+        CERT_FULLCHAIN_FILE="$output_root/cert.crt"
+    else
+        if [[ "$main_domain" == \*.* ]]; then
+            cert_dir="$output_root/certs/${main_domain#\*.}/wildcard/rsa"
         else
-            if [[ -n $(type -P wg-quick) && -n $(type -P wgcf) ]]; then
-                wg-quick up wgcf >/dev/null 2>&1
-            fi
-            if [[ -a "/opt/warp-go/warp-go" ]]; then
-                systemctl start warp-go 
-            fi
+            cert_dir="$output_root/certs/$main_domain/rsa"
+        fi
+        CERT_KEY_FILE="$cert_dir/private.key"
+        CERT_FULLCHAIN_FILE="$cert_dir/cert.crt"
+    fi
+}
 
-            red "抱歉，证书申请失败"
-            green "建议如下: "
-            yellow "1. 自行检测防火墙是否打开, 如使用 80 端口申请模式时, 请关闭防火墙或放行 80 端口"
-            yellow "2. 同一域名多次申请可能会触发 Let's Encrypt 官方风控, 请尝试使用脚本菜单的 9 选项更换证书颁发机构, 再重试申请证书, 或更换域名、或等待 7 天后再尝试执行脚本"
-            yellow "3. 脚本可能跟不上时代, 建议截图发布到 GitHub Issues、GitLab Issues、论坛或 TG 群询问"
+issue_selected_cert() {
+    local main_domain="$1" previous_length status
+    local -a extra_args=()
+    shift
+    cert_paths "$main_domain" || return 1
+
+    # acme.sh stores all RSA sizes in the same domain slot. If the user
+    # explicitly selects another size, renew now instead of reusing it.
+    if [[ -f "$CERT_HOME/$main_domain.conf" ]]; then
+        previous_length=$(sed -n "s/^Le_Keylength='\([^']*\)'$/\1/p" "$CERT_HOME/$main_domain.conf" | head -n 1)
+        if [[ "$CERT_TYPE" == RSA && -z "$previous_length" ]]; then
+            previous_length=2048
+        fi
+        if [[ -n "$previous_length" && "$previous_length" != "$CERT_KEY_LENGTH" ]]; then
+            yellow "现有密钥长度为 $previous_length，将按所选长度 $CERT_KEY_LENGTH 重新签发。"
+            extra_args+=(--force)
         fi
     fi
+
+    bash "$HOME/.acme.sh/acme.sh" --issue "$@" -k "$CERT_KEY_LENGTH" "${extra_args[@]}"
+    status=$?
+    if [[ "$status" == 2 ]]; then
+        # acme.sh uses status 2 when an existing certificate is not due.
+        if [[ -s "$CERT_HOME/fullchain.cer" && -s "$CERT_HOME/$main_domain.key" ]] &&
+           openssl x509 -in "$CERT_HOME/fullchain.cer" -noout -checkend 0 >/dev/null 2>&1; then
+            yellow "现有证书尚未到续期时间，将安装现有证书。"
+            return 0
+        fi
+        red "现有证书不可用，请先检查证书状态。"
+        return 1
+    fi
+    return "$status"
+}
+
+restore_cert_network() {
+    if [[ -n $(type -P wg-quick) && -n $(type -P wgcf) ]]; then
+        wg-quick up wgcf >/dev/null 2>&1
+    fi
+    if [[ -a "/opt/warp-go/warp-go" ]]; then
+        systemctl start warp-go
+    fi
+    return 0
+}
+
+configure_cert_renewal() {
+    # Use the upstream daily check rather than issuing a new cert every day.
+    # Only migrate the exact legacy line owned by this script.
+    local legacy_pattern='^0 0 \* \* \* root bash /root/\.acme\.sh/acme\.sh --cron -f >/dev/null 2>&1$'
+    if bash "$HOME/.acme.sh/acme.sh" --install-cronjob; then
+        if [[ -f /etc/crontab ]]; then
+            sed -i "\|$legacy_pattern|d" /etc/crontab || yellow "旧续期任务清理失败，请检查 /etc/crontab"
+        fi
+    else
+        if [[ -f /etc/crontab ]]; then
+            sed -i "\|$legacy_pattern|s/ --cron -f / --cron /" /etc/crontab || true
+        fi
+        yellow "自动续期任务配置未完成，请检查 acme.sh 的 cron 任务"
+    fi
+}
+
+checktls() {
+    restore_cert_network
+    if [[ ! -s "$CERT_FULLCHAIN_FILE" || ! -s "$CERT_KEY_FILE" ]]; then
+        red "证书安装失败：证书或私钥文件为空或不存在"
+        return 1
+    fi
+
+    # Keep the old marker for consumers of the historical ECC export.
+    if [[ "$CERT_TYPE" == ECC ]]; then
+        printf '%s\n' "$domain" > /root/ca.log
+    fi
+    configure_cert_renewal
+    green "证书申请/安装成功！密钥类型：$CERT_KEY_LENGTH"
+    yellow "证书 crt 文件路径如下: $CERT_FULLCHAIN_FILE"
+    yellow "私钥 key 文件路径如下: $CERT_KEY_FILE"
+}
+
+install_selected_cert() {
+    local main_domain="$1" output_root="${2:-/root}" public_key
+    cert_paths "$main_domain" "$output_root" || return 1
+
+    # Refuse missing or mismatched ACME slots, even on old acme.sh versions
+    # that fall back to ECC when the RSA slot does not exist.
+    if [[ ! -s "$CERT_HOME/fullchain.cer" || ! -s "$CERT_HOME/$main_domain.key" ]]; then
+        red "未找到所选密钥类型的证书"
+        return 1
+    fi
+    if [[ "$CERT_TYPE" == RSA ]]; then
+        public_key=$(openssl x509 -in "$CERT_HOME/fullchain.cer" -noout -text) || return 1
+        if [[ "$public_key" != *"Public Key Algorithm: rsaEncryption"* || "$public_key" != *"Public-Key: ($CERT_KEY_LENGTH bit)"* ]]; then
+            red "证书公钥类型或长度与选择不一致，未覆盖已有导出文件"
+            return 1
+        fi
+        mkdir -p -m 700 -- "${CERT_KEY_FILE%/*}" || return 1
+        chmod 700 -- "${CERT_KEY_FILE%/*}" || return 1
+    fi
+
+    if ! (umask 077; bash "$HOME/.acme.sh/acme.sh" --install-cert -d "$main_domain" \
+        --key-file "$CERT_KEY_FILE" --fullchain-file "$CERT_FULLCHAIN_FILE" \
+        "${CERT_TYPE_ARGS[@]}"); then
+        red "证书安装失败，未执行成功处理"
+        return 1
+    fi
+    chmod 600 -- "$CERT_KEY_FILE" || return 1
+    checktls
 }
 
 acme_standalone(){
     ensure_acme || return 1
+    select_key_type || return 1
 
     check_80
 
@@ -300,6 +417,7 @@ acme_standalone(){
 
     read -rp "请输入解析完成的域名: " domain
     [[ -z $domain ]] && red "未输入域名，无法执行操作！" && exit 1
+    valid_cert_domain "$domain" && [[ "$domain" != \*.* ]] || { restore_cert_network; red "域名格式无效"; return 1; }
     green "已输入的域名：$domain" && sleep 1
 
     domainIP=$(dig @8.8.8.8 +time=2 +short "$domain" 2>/dev/null | sed -n 1p)
@@ -320,11 +438,13 @@ acme_standalone(){
         fi
     fi
     
-    if [[ $domainIP == $ipv6 ]]; then
-        bash ~/.acme.sh/acme.sh --issue -d ${domain} --standalone -k ec-256 --listen-v6 --insecure
-    fi
-    if [[ $domainIP == $ipv4 ]]; then
-        bash ~/.acme.sh/acme.sh --issue -d ${domain} --standalone -k ec-256 --insecure
+    local issue_status=1
+    if [[ -n "$domainIP" && "$domainIP" == "$ipv6" ]]; then
+        issue_selected_cert "$domain" -d "$domain" --standalone --listen-v6 --insecure
+        issue_status=$?
+    elif [[ -n "$domainIP" && "$domainIP" == "$ipv4" ]]; then
+        issue_selected_cert "$domain" -d "$domain" --standalone --insecure
+        issue_status=$?
     fi
     
     if [[ -n $(echo $domainIP | grep nginx) ]]; then
@@ -354,15 +474,23 @@ acme_standalone(){
         fi
     fi
     
-    bash ~/.acme.sh/acme.sh --install-cert -d ${domain} --key-file /root/private.key --fullchain-file /root/cert.crt --ecc
-    checktls
+    if [[ "$issue_status" != 0 ]]; then
+        restore_cert_network
+        red "证书申请失败，未安装证书"
+        return 1
+    fi
+    if ! install_selected_cert "$domain"; then
+        restore_cert_network
+        return 1
+    fi
 }
 
 acme_cfapiTLD(){
     ensure_acme || return 1
+    select_key_type || return 1
 
     read -rp "请输入需要申请证书的域名: " domain
-    [[ -z $domain ]] && red "未输入域名，无法执行操作！" && exit 1
+    valid_cert_domain "$domain" && [[ "$domain" != \*.* ]] || { red "域名格式无效"; return 1; }
 
     if [[ $(echo ${domain:0-2}) =~ cf|ga|gq|ml|tk ]]; then
         red "检测为 Freenom 免费域名, 由于 CloudFlare API 不支持, 故无法使用本模式申请!"
@@ -397,12 +525,8 @@ acme_cfapiTLD(){
     echo ""
     yellow "正在通过 Cloudflare API Token 申请证书..."
 
-    if bash ~/.acme.sh/acme.sh --issue --dns dns_cf -d "${domain}" -k ec-256 --debug; then
-        bash ~/.acme.sh/acme.sh --install-cert -d "${domain}" \
-            --key-file /root/private.key \
-            --fullchain-file /root/cert.crt \
-            --ecc
-        checktls
+    if issue_selected_cert "$domain" --dns dns_cf -d "$domain"; then
+        install_selected_cert "$domain" || return 1
     else
         red "Cloudflare DNS 验证失败，证书未生成。"
         red "请检查 API Token 权限、Zone 范围以及域名是否已托管到 Cloudflare。"
@@ -412,13 +536,14 @@ acme_cfapiTLD(){
 
 acme_cfapiNTLD(){
     ensure_acme || return 1
+    select_key_type || return 1
 
     read -rp "请输入需要申请证书的泛域名 (输入格式：example.com): " domain
-    [[ -z $domain ]] && red "未输入域名，无法执行操作！" && exit 1
+    valid_cert_domain "$domain" && [[ "$domain" != \*.* ]] || { red "域名格式无效"; return 1; }
 
     if [[ $(echo ${domain:0-2}) =~ cf|ga|gq|ml|tk ]]; then
         red "检测为 Freenom 免费域名, 由于 CloudFlare API 不支持, 故无法使用本模式申请!"
-        back2menu
+        return 1
     fi
 
     echo ""
@@ -449,17 +574,9 @@ acme_cfapiNTLD(){
     echo ""
     yellow "正在通过 Cloudflare API Token 申请泛域名证书..."
 
-    if bash ~/.acme.sh/acme.sh --issue --dns dns_cf \
-        -d "*.${domain}" \
-        -d "${domain}" \
-        -k ec-256 \
-        --debug; then
-
-        bash ~/.acme.sh/acme.sh --install-cert -d "*.${domain}" \
-            --key-file /root/private.key \
-            --fullchain-file /root/cert.crt \
-            --ecc
-        checktls
+    if issue_selected_cert "*.${domain}" --dns dns_cf \
+        -d "*.${domain}" -d "$domain"; then
+        install_selected_cert "*.${domain}" || return 1
     else
         red "Cloudflare DNS 验证失败，证书未生成。"
         red "请检查 API Token 权限、Zone 范围以及域名是否已托管到 Cloudflare。"
@@ -475,21 +592,48 @@ view_cert(){
 revoke_cert() {
     ensure_acme || return 1
 
-    bash ~/.acme.sh/acme.sh --list
-    read -rp "请输入要撤销的域名证书 (复制 Main_Domain 下显示的域名): " domain
-    [[ -z $domain ]] && red "未输入域名，无法执行操作!" && exit 1
+    bash "$HOME/.acme.sh/acme.sh" --list
+    read -rp "请输入要撤销的域名证书 (复制 Main_Domain 下显示的域名): " domain || return 1
+    valid_cert_domain "$domain" || { red "域名格式无效"; return 1; }
 
-    if [[ -n $(bash ~/.acme.sh/acme.sh --list | grep $domain) ]]; then
-        bash ~/.acme.sh/acme.sh --revoke -d ${domain} --ecc
-        bash ~/.acme.sh/acme.sh --remove -d ${domain} --ecc
-
-        rm -rf ~/.acme.sh/${domain}_ecc
-        rm -f /root/cert.crt /root/private.key
-
-        green "撤销 ${domain} 的域名证书成功"
-    else
-        red "未找到 ${domain} 的域名证书, 请检查后重新运行!"
+    local choice
+    echo " 1. ECC（默认）"
+    echo " 2. RSA（2048 / 4096）"
+    read -rp "请选择要撤销的证书类型 [1-2]: " choice || return 1
+    case "$choice" in
+        1|"") CERT_TYPE=ECC; CERT_TYPE_ARGS=(--ecc) ;;
+        2) CERT_TYPE=RSA; CERT_TYPE_ARGS=(--keylength 2048) ;;
+        *) red "无效的证书类型"; return 1 ;;
+    esac
+    cert_paths "$domain" || return 1
+    if [[ ! -f "$CERT_HOME/$domain.conf" || ! -s "$CERT_HOME/$domain.cer" ]]; then
+        red "未找到所选类型的域名证书，未撤销任何证书"
+        return 1
     fi
+
+    # Check the historical shared output before removal. Never delete files
+    # belonging to another domain or key family.
+    local remove_export=0
+    if cmp -s -- "$CERT_FULLCHAIN_FILE" "$CERT_HOME/fullchain.cer" &&
+       cmp -s -- "$CERT_KEY_FILE" "$CERT_HOME/$domain.key"; then
+        remove_export=1
+    fi
+    if ! bash "$HOME/.acme.sh/acme.sh" --revoke -d "$domain" "${CERT_TYPE_ARGS[@]}"; then
+        red "撤销失败，保留证书及续期配置"
+        return 1
+    fi
+    if ! bash "$HOME/.acme.sh/acme.sh" --remove -d "$domain" "${CERT_TYPE_ARGS[@]}"; then
+        red "证书已撤销，但停止续期失败，请检查 acme.sh"
+        return 1
+    fi
+
+    rm -rf -- "$CERT_HOME" || return 1
+    if [[ "$remove_export" == 1 ]]; then
+        rm -f -- "$CERT_FULLCHAIN_FILE" "$CERT_KEY_FILE" || return 1
+    else
+        yellow "导出文件未匹配该证书，已保留"
+    fi
+    green "撤销 $domain ($CERT_TYPE) 的域名证书成功"
 }
 
 renew_cert() {
