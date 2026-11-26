@@ -8,6 +8,17 @@
 wget -N --no-check-certificate https://raw.githubusercontent.com/1622663850/acme-script/main/acme_cf_token.sh && bash acme_cf_token.sh
 ```
 
+## 版本查询
+
+主菜单标题区域会显示当前脚本版本（例如 `v1.0.0`）。也可直接查询，无需 root 权限或安装 acme.sh：
+
+```bash
+bash acme_cf_token.sh --version
+# acme-script v1.0.0
+```
+
+短参数 `-v` 与 `--version` 等效。该版本为本项目脚本版本，不是上游 acme.sh 版本。后续发布时统一更新脚本顶部的 `SCRIPT_VERSION`。
+
 ## 安装方式
 
 主菜单选择 **1. 安装 Acme.sh** 后，可选择：
